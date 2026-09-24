@@ -47,10 +47,22 @@ try {
   if (raw) { const d = JSON.parse(raw); DB.clients = d.clients || []; DB.entries = d.entries || []; DB.settings = Object.assign(DB.settings, d.settings || {}); }
 } catch (e) { }
 let bkTimer = null;
-function save() {
-  localStorage.setItem(KEY, JSON.stringify(DB));
+let curKey = KEY;            // hisobsiz: KEY, bulut hisobida: KEY_u_<uid>, kirilmagan: '' (saqlanmaydi)
+// faqat telefonga saqlash (bulutdan kelgan o'zgarishlar uchun ham)
+function saveLocal() {
+  if (curKey) { try { localStorage.setItem(curKey, JSON.stringify(DB)); } catch (e) { toast("Telefon xotirasiga saqlanmadi", 3000); } }
   clearTimeout(bkTimer); bkTimer = setTimeout(autoBackup, 1500);
+  clearTimeout(ntTimer); ntTimer = setTimeout(scheduleReminders, 800);
 }
+// telefonga saqlash + bulutga yuborish
+function save() { saveLocal(); if (window.Cloud) Cloud.push(); }
+function switchStorage(suffix) {
+  curKey = suffix === '__none' ? '' : suffix ? KEY + '_' + suffix : KEY;
+  let d = null; try { d = curKey ? JSON.parse(localStorage.getItem(curKey) || 'null') : null; } catch (e) { }
+  DB.clients = (d && d.clients) || []; DB.entries = (d && d.entries) || [];
+  if (d && d.settings && suffix !== '__none') DB.settings = Object.assign(DB.settings, d.settings);
+}
+let ntTimer = null;
 const client = (id) => DB.clients.find(c => c.id === id);
 const sortKey = (e) => e.date + ' ' + (e.time || '00:00') + ' ' + (e.created || 0);
 function stats(cid) {
@@ -122,6 +134,7 @@ function renderHome() {
   const t = todayISO(); let td = 0, tp = 0;
   for (const e of DB.entries) if (e.date === t) { if (e.type === 'pay') tp += e.amount; else td += e.amount; }
   $('homeToday').textContent = (td || tp) ? 'Bugun: +' + fmt(td) + ' qarz, −' + fmt(tp) + " to'lov" : '';
+  renderDue();
   const list = rows.filter(r => !q || r.c.name.toLowerCase().includes(q) || (r.c.phone || '').includes(q));
   if (!DB.clients.length) {
     $('clientList').innerHTML = '<div class="empty"><b>Daftar hali bo\'sh</b>"+ Mijoz" tugmasi bilan birinchi mijozni qo\'shing yoki pastdagi 🎤 tugmani bosib ayting: "Farruxga 2 qop un 300 ming".</div>';
@@ -138,6 +151,79 @@ function renderHome() {
 }
 $('clientList').addEventListener('click', (ev) => { const r = ev.target.closest('[data-cid]'); if (r) openClient(r.dataset.cid); });
 $('q').addEventListener('input', renderHome);
+
+/* ---------- QAYTARISH MUDDATI: bosh sahifadagi eslatmalar ---------- */
+let dueAll = false;
+function renderDue() {
+  const all = QarzDue.reminders(DB, todayISO());
+  const urgent = all.filter(r => r.st.kind === 'late' || r.st.kind === 'today');
+  const soon = all.filter(r => r.st.kind === 'soon');
+  const show = dueAll ? all : urgent.concat(soon);
+  const box = $('dueBox');
+  if (!show.length && !all.length) { box.classList.add('hidden'); return; }
+  box.classList.remove('hidden');
+  const late = urgent.some(r => r.st.kind === 'late');
+  const head = urgent.length ? (late ? '⏰ Qarz qaytarish muddati keldi' : '⏰ Bugun qaytarish kuni') : '📅 Yaqinda qaytariladigan qarzlar';
+  box.innerHTML = '<div class="duecard"><div class="duehead ' + (late ? 'late' : '') + '"><span>' + head + '</span><span>' + (urgent.length || soon.length || all.length) + '</span></div>' +
+    (show.length ? show.map(r => {
+      const ph = r.client.phone;
+      return '<div class="duerow"><button class="main" data-duecid="' + r.client.id + '"><div class="nm">' + esc(r.client.name) + '</div>' +
+        '<div class="meta"><b class="' + r.st.kind + '">' + esc(r.st.text) + '</b> · ' + dateShort(r.due) + ' · <span class="num">' + fmt(r.left) + " so'm</span></div></button>" +
+        '<button class="callbtn ' + (ph ? '' : 'off') + '" data-call="' + r.client.id + '" aria-label="Qo\'ng\'iroq">📞</button></div>';
+    }).join('') : '<div class="duerow"><div class="main meta">Bugun va yaqin kunlarda muddat yo\'q</div></div>') +
+    (all.length > show.length || dueAll ? '<button class="duemore" id="dueMore">' + (dueAll ? 'Faqat yaqinlarini ko\'rsatish' : 'Barcha muddatlar (' + all.length + ')') + '</button>' : '') + '</div>';
+}
+$('dueBox').addEventListener('click', (ev) => {
+  const call = ev.target.closest('[data-call]');
+  if (call) {
+    const c = client(call.dataset.call);
+    if (c && c.phone) location.href = 'tel:' + c.phone.replace(/[^\d+]/g, '');
+    else { toast("Telefon raqami kiritilmagan. Mijoz sahifasida ⋮ → O'zgartirish", 3500); }
+    return;
+  }
+  if (ev.target.closest('#dueMore')) { dueAll = !dueAll; renderDue(); return; }
+  const r = ev.target.closest('[data-duecid]'); if (r) openClient(r.dataset.duecid);
+});
+
+/* ---------- telefon bildirishnomalari (ilova yopiq bo'lsa ham) ---------- */
+let ntAsked = false;
+async function scheduleReminders() {
+  const LN = plugin('LocalNotifications'); if (!LN) return;
+  try {
+    const today = todayISO(), now = new Date();
+    const list = QarzDue.reminders(DB, today);
+    const pend = await LN.getPending();
+    const old = (pend.notifications || []).filter(n => n.extra && n.extra.qd).map(n => ({ id: n.id }));
+    if (old.length) await LN.cancel({ notifications: old });
+    const notes = [];
+    const at9 = (iso) => { const [y, m, d] = iso.split('-').map(Number); return new Date(y, m - 1, d, 9, 0, 0); };
+    for (const r of list) {
+      const who = r.client.name, sum = fmt(r.left) + " so'm";
+      const t1 = at9(r.due);
+      if (t1 > now) notes.push({ id: QarzDue.notifId(r.entry.id, 0), title: '⏰ Qarz qaytarish kuni: ' + who,
+        body: 'Bugun ' + who + ' qarzini qaytarishi kerak: ' + sum + ". Qo'ng'iroq qiling.", schedule: { at: t1, allowWhileIdle: true },
+        isExactNotification: false, extra: { qd: 1, clientId: r.client.id } });
+      const t2 = at9(QarzDueAdd(r.due, 1));
+      if (t2 > now) notes.push({ id: QarzDue.notifId(r.entry.id, 1), title: '❗ Muddat o\'tdi: ' + who,
+        body: who + ' qarzini qaytarmadi: ' + sum + ". Qo'ng'iroq qiling.", schedule: { at: t2, allowWhileIdle: true },
+        isExactNotification: false, extra: { qd: 1, clientId: r.client.id } });
+    }
+    if (!notes.length) return;
+    let perm = await LN.checkPermissions();
+    if (perm.display !== 'granted' && !ntAsked) { ntAsked = true; perm = await LN.requestPermissions(); }
+    if (perm.display !== 'granted') return;
+    await LN.schedule({ notifications: notes.slice(0, 60) });
+  } catch (e) { console.warn('Eslatma:', e && e.message); }
+}
+function QarzDueAdd(iso, n) { return addDays(iso, n); }
+function initNotifications() {
+  const LN = plugin('LocalNotifications'); if (!LN) return;
+  LN.addListener('localNotificationActionPerformed', (a) => {
+    const cid = a && a.notification && a.notification.extra && a.notification.extra.clientId;
+    if (cid && client(cid)) setTimeout(() => openClient(cid), 300);
+  });
+  scheduleReminders();
+}
 
 /* ---------- MIJOZ SAHIFASI ---------- */
 function renderClient() {
@@ -159,6 +245,14 @@ function renderClient() {
   }
   $('cHistory').innerHTML = html;
 }
+function dueLine(e) {
+  if (e.type === 'pay' || !e.due) return '';
+  const open = QarzDue.openDebts(DB.entries, e.clientId).find(o => o.entry.id === e.id);
+  if (!open) return '<div class="due paid">✓ Muddat: ' + dateShort(e.due) + ' — to\'langan</div>';
+  const st = QarzDue.status(e.due, todayISO());
+  return '<div class="due ' + (st.kind === 'late' ? 'late' : '') + '">⏰ Oxirgi muddat: ' + dateShort(e.due) + ' (' + st.text.toLowerCase() + ')' +
+    (open.left < e.amount ? ' · qoldi ' + fmt(open.left) : '') + '</div>';
+}
 function entryHTML(e, withName) {
   const pay = e.type === 'pay';
   const c = client(e.clientId);
@@ -169,7 +263,7 @@ function entryHTML(e, withName) {
     '<div class="l1"><span class="kind">' + (withName ? esc(c ? c.name : '?') : (pay ? "To'lov" : 'Qarz berildi')) + '</span>' +
     '<span class="num amt ' + (pay ? 'pay' : 'debt') + '">' + (pay ? '−' : '+') + fmt(e.amount) + '</span></div>' +
     (withName && pay ? '<div class="nt">To\'lov qildi</div>' : '') + items +
-    (e.note ? '<div class="nt">' + esc(e.note) + '</div>' : '') +
+    (e.note ? '<div class="nt">' + esc(e.note) + '</div>' : '') + dueLine(e) +
     (withName ? '' : '<div class="bal num">%BAL%</div>') + '</button>';
 }
 $('cHistory').addEventListener('click', (ev) => { const r = ev.target.closest('[data-eid]'); if (r) openEntry({ id: r.dataset.eid }); });
@@ -245,6 +339,9 @@ function openEntry(opts) {
   fillClientSelect();
   $('eDate').value = E.date; $('eTime').value = E.time || nowHM();
   $('eNote').value = E.note || '';
+  $('eDueOn').checked = !!E.due;
+  $('eDue').value = E.due || addDays(E.date || todayISO(), 7);
+  $('eDueBox').classList.toggle('hidden', !E.due);
   $('ePayAmt').value = E.type === 'pay' && E.amount ? fmt(E.amount) : '';
   $('eDelete').classList.toggle('hidden', !E._edit);
   setType(E.type);
@@ -342,6 +439,11 @@ $('eVoiceAdd').onclick = () => listen((text) => {
   E.items = E.items.filter(i => i.name || i.sum).concat(r.items);
   renderItems();
 });
+$('eDueOn').onchange = () => {
+  $('eDueBox').classList.toggle('hidden', !$('eDueOn').checked);
+  if ($('eDueOn').checked && !$('eDue').value) $('eDue').value = addDays($('eDate').value || todayISO(), 7);
+};
+document.querySelectorAll('[data-dd]').forEach(b => b.onclick = () => { $('eDue').value = addDays($('eDate').value || todayISO(), +b.dataset.dd); });
 $('eSave').onclick = () => {
   let cid = $('eClient').value;
   if (cid === '__new') {
@@ -360,6 +462,11 @@ $('eSave').onclick = () => {
     out.items = E.items.filter(i => (i.name && i.name.trim()) || i.sum).map(i => ({ name: (i.name || '').trim() || 'Tovar', qty: i.qty || 1, price: i.price || 0, sum: Math.round(i.sum || 0) }));
     out.amount = out.items.reduce((a, b) => a + b.sum, 0);
     if (!out.amount) { toast('Kamida bitta tovar summasini kiriting'); return; }
+    if ($('eDueOn').checked) {
+      out.due = $('eDue').value;
+      if (!out.due) { toast('Oxirgi muddat sanasini tanlang'); return; }
+      if (out.due < out.date) { toast("Oxirgi muddat qarz sanasidan oldin bo'lishi mumkin emas"); return; }
+    }
   }
   const idx = DB.entries.findIndex(x => x.id === out.id);
   if (idx >= 0) DB.entries[idx] = out; else DB.entries.push(out);
@@ -367,7 +474,7 @@ $('eSave').onclick = () => {
   const wasOnClient = curClient;
   back();
   const s = stats(cid);
-  toast((out.type === 'pay' ? "To'lov yozildi. " : 'Qarz yozildi. ') + client(cid).name + ' qarzi: ' + fmt(s.bal) + " so'm", 3200);
+  toast((out.type === 'pay' ? "To'lov yozildi. " : 'Qarz yozildi. ') + client(cid).name + ' qarzi: ' + fmt(s.bal) + " so'm" + (out.due ? '. Eslatma: ' + dateShort(out.due) : ''), 3200);
   if (!wasOnClient) setTimeout(() => openClient(cid), 150);
 };
 $('eDelete').onclick = () => {
@@ -562,7 +669,7 @@ async function autoBackup() {
     try {
       await FS.writeFile({ path: 'QarzDaftari/' + n, data: backupJSON(), directory: 'DOCUMENTS', encoding: 'utf8', recursive: true });
       DB.settings.autoBk = 'Documents/QarzDaftari/' + n + ' — ' + dateShort(todayISO()) + ' ' + nowHM();
-      localStorage.setItem(KEY, JSON.stringify(DB));
+      if (curKey) localStorage.setItem(curKey, JSON.stringify(DB));
       if (tab === 'settings') renderSettings();
       return;
     } catch (e) { }
@@ -615,5 +722,15 @@ document.querySelectorAll('nav.bottom button[data-v]').forEach(b => b.onclick = 
 });
 
 showTab('home');
-window.__qd = { DB, parse: (t) => QarzParser.parse(t, DB.clients), voiceToEntry };
+initNotifications();
+if (window.Cloud) Cloud.start({
+  getDB: () => DB,
+  saveLocal, switchStorage, toast, fmt,
+  refresh: () => { refresh(); },
+  dropStorage: (suffix) => { try { localStorage.removeItem(KEY + '_' + suffix); } catch (e) { } },
+  legacyData: () => { try { const d = JSON.parse(localStorage.getItem(KEY) || 'null'); return d ? { clients: d.clients || [], entries: d.entries || [] } : null; } catch (e) { return null; } },
+  openSettings: () => { const b = document.querySelector('nav.bottom [data-v=settings]'); if (b) b.click(); }
+});
+document.addEventListener('visibilitychange', () => { if (!document.hidden && tab === 'home' && !curClient) renderHome(); });
+window.__qd = { sched: scheduleReminders, DB, parse: (t) => QarzParser.parse(t, DB.clients), voiceToEntry };
 })();

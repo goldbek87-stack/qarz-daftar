@@ -18,9 +18,6 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: Android SDK'ni sozlash
-        uses: android-actions/setup-android@v3
-
       - name: Node.js'ni sozlash
         uses: actions/setup-node@v4
         with:
